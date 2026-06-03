@@ -106,6 +106,98 @@ export async function waitForItemInClickHouse(
   );
 }
 
+/**
+ * Polls `analytics.ACTION_EXECUTIONS` for a row where the given action fired on
+ * the given item submission. Returned by RuleEngine when a rule's conditions
+ * match and the rule has actions attached; the row is written via
+ * ActionPublisher after the worker finishes processing the submission.
+ *
+ * Tests use this to assert "the rule fired for this item" without coupling to
+ * the rule's internals — we only care that the resulting action execution
+ * landed in the warehouse.
+ */
+type ActionExecutionRow = {
+  action_id: string;
+  item_id: string | null;
+  item_type_id: string | null;
+  rules: string;
+};
+
+export async function waitForActionExecution(
+  deps: Pick<Dependencies, 'DataWarehouse' | 'Tracer'>,
+  opts: {
+    orgId: string;
+    actionId: string;
+    itemIdentifier: ItemIdentifier;
+    timeoutMs?: number;
+  },
+): Promise<ActionExecutionRow> {
+  const { orgId, actionId, itemIdentifier } = opts;
+  return waitFor(
+    `action ${actionId} execution for item ${itemIdentifier.id} in ClickHouse ACTION_EXECUTIONS`,
+    async () => {
+      const rows = (await deps.DataWarehouse.query(
+        `SELECT action_id, item_id, item_type_id, rules
+           FROM analytics.ACTION_EXECUTIONS
+          WHERE org_id = ?
+            AND action_id = ?
+            AND item_id = ?
+            AND item_type_id = ?
+          LIMIT 1`,
+        deps.Tracer,
+        [orgId, actionId, itemIdentifier.id, itemIdentifier.typeId],
+      )) as readonly ActionExecutionRow[];
+      return rows.length > 0 ? rows[0] : null;
+    },
+    { timeoutMs: opts.timeoutMs },
+  );
+}
+
+/**
+ * Asserts the *absence* of an action execution. Proving a negative requires
+ * waiting long enough that the worker would have written a row if it were
+ * going to — but a fixed sleep races against rule evaluation latency.
+ *
+ * Instead we gate on `analytics.CONTENT_API_REQUESTS`, which `ItemProcessingWorker`
+ * writes *after* `ruleEngine.runEnabledRules` returns (see the worker around
+ * Scylla → rules → contentApiLogger). Once that row is visible, the rule path
+ * for this submission has fully run; if no `ACTION_EXECUTIONS` row exists at
+ * that point, none will.
+ *
+ * Both writes go through `analytics.bulkWrite` with the same default
+ * batchTimeout, so seeing CONTENT_API_REQUESTS implies that batch interval
+ * has elapsed — long enough for an ACTION_EXECUTIONS batch from the same
+ * submission to have flushed.
+ */
+export async function assertNoActionExecution(
+  deps: Pick<Dependencies, 'DataWarehouse' | 'Tracer'>,
+  opts: {
+    orgId: string;
+    actionId: string;
+    itemIdentifier: ItemIdentifier;
+    timeoutMs?: number;
+  },
+) {
+  const { orgId, actionId, itemIdentifier, timeoutMs } = opts;
+  await waitForItemInClickHouse(deps, { orgId, itemIdentifier, timeoutMs });
+  const rows = await deps.DataWarehouse.query(
+    `SELECT action_id, item_id
+       FROM analytics.ACTION_EXECUTIONS
+      WHERE org_id = ?
+        AND action_id = ?
+        AND item_id = ?
+        AND item_type_id = ?
+      LIMIT 1`,
+    deps.Tracer,
+    [orgId, actionId, itemIdentifier.id, itemIdentifier.typeId],
+  );
+  if (rows.length > 0) {
+    throw new Error(
+      `Expected no action execution for action ${actionId} on item ${itemIdentifier.id}, but found one in ACTION_EXECUTIONS`,
+    );
+  }
+}
+
 export type ReportingServiceReportRow = {
   request_id: string;
   reported_item_id: string;

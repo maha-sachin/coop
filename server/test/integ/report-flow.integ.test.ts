@@ -96,7 +96,6 @@ describe('Report flow (integration)', () => {
       try {
         await fn();
       } catch (err) {
-         
         console.warn('[report-flow.integ] cleanup step failed', err);
       }
     };
